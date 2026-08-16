@@ -737,10 +737,25 @@ function addPhotos(e){
   const files=[...e.target.files];
   files.forEach(f=>{
     const r=new FileReader();
-    r.onload=()=>{formPhotos.push({id:uid(),data:r.result});drawPhotos();};
+    r.onload=()=>{compressImage(r.result,(compressed)=>{formPhotos.push({id:uid(),data:compressed});drawPhotos();});};
     r.readAsDataURL(f);
   });
   e.target.value='';
+}
+/* kompres gambar di browser: maks 1280px sisi terpanjang, kualitas JPEG 0.7 */
+function compressImage(dataUrl,cb,maxDim,quality){
+  maxDim=maxDim||1280;quality=quality||0.7;
+  const img=new Image();
+  img.onload=()=>{
+    let w=img.width,h=img.height;
+    if(w>h&&w>maxDim){h=Math.round(h*maxDim/w);w=maxDim;}
+    else if(h>=w&&h>maxDim){w=Math.round(w*maxDim/h);h=maxDim;}
+    const cv=document.createElement('canvas');cv.width=w;cv.height=h;
+    cv.getContext('2d').drawImage(img,0,0,w,h);
+    try{cb(cv.toDataURL('image/jpeg',quality));}catch(e){cb(dataUrl);}
+  };
+  img.onerror=()=>cb(dataUrl);
+  img.src=dataUrl;
 }
 function drawPhotos(){
   const g=document.getElementById('photoGrid');if(!g)return;
@@ -907,6 +922,11 @@ function flowHtml(status){
 
 function openDetail(id){
   const r=DATA.find(x=>x.id===id);if(!r)return;
+  // muat foto dari Drive bila record punya photoIds tapi belum ada foto lokal
+  const needPhotos=(r.photoIds&&r.photoIds.length)&&!(r.photos&&r.photos.length);
+  if(needPhotos&&syncConfigured()&&navigator.onLine){
+    ensurePhotos(r).then(()=>{const still=document.getElementById('modalDetail');if(still&&still.classList.contains('show'))openDetail(id);});
+  }
   const u=currentUser();
   document.getElementById('mdTitle').textContent=r.number+' — '+r.title;
   const sevCell=(v)=>{if(v===''||v==null)return '<span style="color:#b0b8c6">–</span>';return `<b>${esc(v)}</b>`;};
@@ -949,7 +969,7 @@ function openDetail(id){
   // ---- Kasus khusus: notifikasi DITOLAK, dilihat oleh user pembuat (atau superuser) ----
   // Pilihan export diganti menjadi: Edit (perbaiki sesuai alasan tolak), Simpan Draft, Ajukan review CRS
   if(isRejected&&(isOwner||u.role==='user'||u.role==='superuser')){
-    add('✏️ Edit (Perbaiki)','btn-primary',()=>editRecord(r));
+    add('✏️ Edit (Perbaiki)','btn-primary',()=>ensurePhotos(r).then(()=>editRecord(r)));
     add('📤 Ajukan Ulang ke CRS','btn-accent',()=>transition(r,'review_crs','Diajukan ulang review ke CRS setelah perbaikan'));
     if(u.role==='superuser') add('🗑️ Hapus','btn-danger',()=>{if(confirm('Hapus notifikasi '+r.number+'?')){softDeleteIncident(r.id);closeModal('modalDetail');goPage('list');toast('Terhapus.','warn');}});
     openModal('modalDetail');return;
@@ -958,15 +978,15 @@ function openDetail(id){
   // ---- Export PDF/PPT: untuk record approved (semua), atau CRS/PJA/superuser kapan saja ----
   const canExport=(r.status==='approved')||['crs','pja','superuser'].includes(u.role);
   if(canExport){
-    add('📄 Export PDF','btn',()=>exportPDF(r));
-    add('📊 Export PPT','btn',()=>exportPPT(r));
+    add('📄 Export PDF','btn',()=>ensurePhotos(r).then(()=>exportPDF(r)));
+    add('📊 Export PPT','btn',()=>ensurePhotos(r).then(()=>exportPPT(r)));
   }
 
   // ---- Edit ----
   const canEdit=(r.status==='draft'&&(isOwner||u.role==='superuser'||u.role==='crs'))
             ||((u.role==='crs'||u.role==='superuser')&&r.status==='review_crs')
             ||((u.role==='pja'||u.role==='superuser')&&r.status==='review_pja');
-  if(canEdit) add('✏️ Edit','btn',()=>editRecord(r));
+  if(canEdit) add('✏️ Edit','btn',()=>ensurePhotos(r).then(()=>editRecord(r)));
 
   // ---- Workflow transitions ----
   if((u.role==='user'||u.role==='superuser')&&r.status==='draft'&&(isOwner||u.role==='superuser'))
@@ -1951,8 +1971,21 @@ function syncConfigured(){const c=syncCfg();return !!(c.url&&c.secret);}
 
 /* payload seluruh data lokal untuk dikirim ke server */
 function syncPayload(){
+  // foto (base64) TIDAK dikirim ke Sheet. Sebagai gantinya foto diunggah ke
+  // Drive (lewat uploadPhoto) dan hanya photoIds (pendek) yang disimpan.
+  const incidentsNoPhoto=DATA.map(r=>{
+    const c=Object.assign({},r);
+    // kumpulkan driveId dari foto yang sudah terunggah
+    if(c.photos&&c.photos.length){
+      const ids=c.photos.map(p=>p.driveId).filter(Boolean);
+      if(ids.length)c.photoIds=ids;
+      c.hasPhoto=true;
+    }
+    delete c.photos;
+    return c;
+  });
   return {
-    incidents:DATA,
+    incidents:incidentsNoPhoto,
     users:USERS,
     ccow:CCOW_MASTER,
     company:COMPANY_MASTER,
@@ -1960,15 +1993,56 @@ function syncPayload(){
     locm:LOC_MASTER
   };
 }
-/* terapkan data hasil merge dari server ke lokal */
+/* unggah semua foto yang belum punya driveId ke Drive; simpan driveId-nya */
+async function uploadPendingPhotos(){
+  if(!syncConfigured())return;
+  const pending=[];
+  DATA.forEach(r=>{(r.photos||[]).forEach(p=>{if(p.data&&!p.driveId)pending.push(p);});});
+  if(!pending.length)return;
+  // unggah bertahap (maks 3 foto per panggilan agar tidak terlalu besar)
+  for(let i=0;i<pending.length;i+=3){
+    const batch=pending.slice(i,i+3);
+    const j=await syncCall('uploadPhoto',{photos:batch.map(p=>({name:p.id+'.jpg',data:p.data}))});
+    if(j.ids)batch.forEach((p,k)=>{if(j.ids[k])p.driveId=j.ids[k];});
+  }
+  // catat photoIds di tiap record & simpan
+  DATA.forEach(r=>{if(r.photos&&r.photos.length){const ids=r.photos.map(p=>p.driveId).filter(Boolean);if(ids.length)r.photoIds=ids;}});
+  save(LS_DATA,DATA);
+}
+/* terapkan data hasil merge dari server ke lokal — pertahankan foto lokal */
 function applyServerData(d){
   if(!d)return;
-  if(Array.isArray(d.incidents)){DATA=d.incidents;save(LS_DATA,DATA);}
+  if(Array.isArray(d.incidents)){
+    // simpan foto lokal per-id sebelum menimpa
+    const localPhotos={};
+    DATA.forEach(r=>{if(r.photos&&r.photos.length)localPhotos[r.id]=r.photos;});
+    DATA=d.incidents.map(r=>{
+      const c=Object.assign({},r);
+      if(!c.photos&&localPhotos[c.id])c.photos=localPhotos[c.id]; // pasang kembali foto lokal
+      return c;
+    });
+    save(LS_DATA,DATA);
+  }
   if(Array.isArray(d.users)&&d.users.length){USERS=d.users;save(LS_USERS,USERS);}
   if(Array.isArray(d.ccow)&&d.ccow.length){CCOW_MASTER=d.ccow;save(LS_CCOW,CCOW_MASTER);}
   if(Array.isArray(d.company)){COMPANY_MASTER=d.company;save(LS_COMPANY,COMPANY_MASTER);}
   if(Array.isArray(d.classm)&&d.classm.length){CLASS_MASTER=d.classm;save(LS_CLASS,CLASS_MASTER);}
   if(Array.isArray(d.locm)&&d.locm.length){LOC_MASTER=d.locm;save(LS_LOC,LOC_MASTER);}
+}
+/* ambil foto dari Drive untuk record yg punya photoIds tapi belum ada data lokal */
+async function ensurePhotos(rec){
+  if(!rec||!syncConfigured())return rec;
+  const have=new Set((rec.photos||[]).map(p=>p.driveId).filter(Boolean));
+  const need=(rec.photoIds||[]).filter(id=>!have.has(id));
+  if(!need.length)return rec;
+  if(!navigator.onLine){toast('Foto tersimpan online — sambungkan internet untuk memuatnya.','warn');return rec;}
+  try{
+    const j=await syncCall('getPhoto',{ids:need});
+    rec.photos=rec.photos||[];
+    need.forEach(id=>{const data=j.photos&&j.photos[id];if(data)rec.photos.push({id:uid(),data,driveId:id});});
+    save(LS_DATA,DATA);
+  }catch(e){/* diamkan; tampilkan tanpa foto */}
+  return rec;
 }
 
 let _syncing=false, _syncPendingWhileOffline=false;
@@ -2003,6 +2077,7 @@ async function doSync(silent){
   if(!navigator.onLine){setSyncBadge('off');_syncPendingWhileOffline=true;if(!silent)toast('Sedang offline — akan disinkron saat online kembali.','warn');return false;}
   _syncing=true;setSyncBadge('busy');
   try{
+    await uploadPendingPhotos();            // unggah foto ke Drive dulu (bila ada)
     const json=await syncCall('sync',{data:syncPayload()});
     applyServerData(json.data);
     const c=syncCfg();c.lastSync=new Date().toISOString();saveSyncCfg(c);
