@@ -1,0 +1,9 @@
+{
+  "name": "notifikasi-awal-insiden",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Aplikasi Notifikasi Awal Insiden - PT Maruwai Coal (Alamtri)",
+  "scripts": {
+    "build": "echo \"Static site - no build step\" && exit 0"
+  }
+}
